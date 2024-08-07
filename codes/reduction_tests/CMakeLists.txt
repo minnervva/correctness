@@ -22,16 +22,11 @@ endif()
 
 # set language and standard
 set(CMAKE_CXX_STANDARD 17)
-option(REDUCE_USE_SCOREP "Use scorep to monitor power comsumption. Will also be turned on for gpu" OFF)
 option(REDUCE_USE_CUDA "Compile with CUDA support" OFF)
 option(REDUCE_USE_HIP "Compile with HIP support" OFF)
 
 if ((REDUCE_USE_CUDA AND REDUCE_USE_HIP) OR ((NOT REDUCE_USE_CUDA) AND (NOT REDUCE_USE_HIP)))
   message(FATAL_ERROR "HIP and CUDA backend can not be both selected. Use either -DREDUCE_USE_CUDA or -DREDUCE_USE_HIP")
-endif()
-
-if (REDUCE_USE_SCOREP)
-  set(CMAKE_CXX_COMPILER scorep-g++)
 endif()
 
 find_package(OpenMP REQUIRED COMPONENTS C CXX)
@@ -40,18 +35,12 @@ if (REDUCE_USE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   set(WHIP_BACKEND "CUDA")
-  if (REDUCE_USE_SCOREP)
-    set(CMAKE_CUDA_COMPILER "scopep --nocompiler ${CMAKE_CUDA_COMPILER}")
-  endif()
 endif ()
 
 if (REDUCE_USE_HIP)
   enable_language(HIP)
   find_package(hiprand REQUIRED IMPORTED CONFIG)
   set(WHIP_BACKEND "HIP")
-  if (REDUCE_USE_SCOREP)
-    set(CMAKE_HIP_COMPILER "scopep --nocompiler ${CMAKE_HIP_COMPILER}")
-  endif()
 endif()
 include(FetchContent)
 
@@ -99,7 +88,7 @@ FetchContent_MakeAvailable(fmt)
 # FetchContent_MakeAvailable(whip)                        #
 ###########################################################
 
-add_executable(test_reduce ornl_reduce.cu reduce_test.cpp utils.cu timing/rt_graph.cpp)
+add_executable(test_reduce reduce.cu reduce_test.cpp utils.cu timing/rt_graph.cpp)
 
 if (REDUCE_USE_HIP)
 	set_source_files_properties(ornl_reduce.cu utils.cu PROPERTIES LANGUAGE HIP)

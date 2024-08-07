@@ -10,6 +10,8 @@
 #include <random>
 #include <string>
 
+std::string GPU_TYPE;
+
 #ifdef REDUCE_USE_CUDA
 #include "whip/cuda/whip.hpp"
 #include <curand.h>
@@ -22,6 +24,8 @@
 #include "mdarray.hpp"
 #include "timing/rt_graph.hpp"
 #include "utils.hpp"
+
+std::vector<std::pair<std::string, reduction_method>> method_to_test;
 
 /* Reference values for summing 100 samples of 1 M uniformly distributed FP
  * elements the RNG is mercenne twister from the c++ library not the GPU
@@ -88,25 +92,30 @@ void sanity_check(whip::stream_t &stream_) {
   sum_.copy<memory_t::host, memory_t::device>();
   whip::malloc(&scratch__, sizeof(double) * 10000);
 
-  const double result_of_sum = 2.506628274631001;
-  fmt::print("Sanity checks. Computing the numerical integral of exp(-x^2/2) between -10 and 10\n");
-  fmt::print("Result of the sum with Erf function: {}\n", result_of_sum);
-  fmt::print("Checking Kahan sum:                  {:.15f}\n", KahanBabushkaNeumaierSum(sum_.at<device_t::CPU>(), sum_.size())  * 0.001);
-  fmt::print("Checking det sum on GPU:             {:.15f}\n", reduce_step_det<double>(stream_,
-                                                                        256,
-                                                                        -1, sum_.size(),
-                                                                        sum_.at<device_t::GPU>(), scratch__) * 0.001);
-  fmt::print("Checking non-det sum on GPU:         {:.15f}\n", reduce_step_non_det<double>(stream_,
-                                                                          256,
-                                                                          -1, sum_.size(),
-                                                                          sum_.at<device_t::GPU>(), scratch__) * 0.001);
-  fmt::print("Checking det-shuffle sum on GPU:     {:.15f}\n", reduce_step_det_shuffle<double>(stream_,
-                                                                                  256,
-                                                                                  -1, sum_.size(),
-                                                                                  sum_.at<device_t::GPU>(), scratch__) * 0.001);
-  fmt::print("Checking full atomic sum on GPU:     {:.15f}\n", reduce_atomic<double>(stream_, sum_.size(),
-                                                                                               sum_.at<device_t::GPU>(), scratch__) * 0.001);
+  fmt::print("┌{0:─^{2}}┐\n"
+             "│{1: ^{2}}│\n"
+             "└{0:─^{2}}┘\n\n",
+             "", "Sanity checks", 70);
 
+  const double result_of_sum = 2.506628274631001;
+  fmt::print("Computing the numerical integral of exp(-x^2/2) "
+             "between -10 and 10\n\n");
+  fmt::print("{0:<50} {1:>20.15f}\n",
+             "Result of the sum with Erf function:", result_of_sum);
+  fmt::print("{0:<50} {1:>20.15f}\n", "Checking Kahan sum:",
+             KahanBabushkaNeumaierSum(sum_.at<device_t::CPU>(), sum_.size()) *
+                 0.001);
+  fmt::print("{0:<50} {1:>20.15f}\n", "Checking Recursive sum:",
+             recursive_sum(sum_.at<device_t::CPU>(), sum_.size()) * 0.001);
+  for (auto &&mt : method_to_test) {
+    if (mt.second != reduction_method::cub_reduce_method) {
+      double result = reduce<double>(mt.second, stream_, 256, 0, sum_.size(),
+                                     sum_.at<device_t::GPU>(), scratch__);
+      fmt::print("Checking {0:<41} {1:>20.15f}\n", mt.first + ":",
+                 result * 0.001);
+    }
+  }
+  fmt::print("\n");
   whip::free(scratch__);
   sum_.clear();
 }
@@ -123,7 +132,6 @@ void performance_tests(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
       indicators::option::Lead{"■"},
       indicators::option::Remainder{"-"},
       indicators::option::End{" ]"},
-      indicators::option::PostfixText{"Performance tests"},
       indicators::option::ForegroundColor{indicators::Color::cyan},
       indicators::option::FontStyles{
           std::vector<indicators::FontStyle>{indicators::FontStyle::bold}}};
@@ -137,9 +145,6 @@ void performance_tests(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
   const int number_of_samples__ = 100;
   const int max_num_blocks__ = (number_of_fp__ + 64 - 1) / 64;
 
-  mdarray<double, 4, CblasRowMajor> timings_(6, 4, 17, 10);
-
-  timings_.zero();
   generator_t gen_;
   void *scratch__ = nullptr;
   mdarray<double, 2, CblasRowMajor> data__(number_of_samples__, number_of_fp__);
@@ -154,7 +159,6 @@ void performance_tests(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
   /* Initializing the cub algorithm */
   cub_reduce(stream__, temp_storage_bytes, temp_storage, number_of_fp__,
              data__.at<device_t::GPU>(0, 0), static_cast<double *>(scratch__));
-
   whip::malloc(&temp_storage, temp_storage_bytes);
 
   CreateGenerator(&gen_, 0x514ea3f);
@@ -162,15 +166,35 @@ void performance_tests(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "Performance tests", 60);
+             "", "Performance tests", 70);
 
-  fmt::print("Measure the time required to execute 100 reductions on 1 million "
-             "elements with different reduction algorithms and runtime "
-             "parameters.\n\n");
+  fmt::print("Measure the time required to execute 100 reductions on {}\n"
+             "elements with different reduction algorithms and runtime\n"
+             "parameters.\n\n",
+             number_of_fp__);
 
   timer__.start("gen_rng_gpu");
   GenerateUniformDouble(gen_, data__.at<device_t::GPU>(), data__.size());
   timer__.stop("gen_rng_gpu");
+
+  // now a list of variant we want to measure runtime
+
+  std::vector<int> block_size = {64, 128, 256, 512};
+  std::vector<int> grid_size;
+
+  grid_size.clear();
+  for (int block = 64; block < max_num_blocks__; block *= 2) {
+    grid_size.push_back(block);
+  }
+
+  mdarray<double, 4, CblasRowMajor> timings_(
+      method_to_test.size(), block_size.size(), grid_size.size(), 10);
+  mdarray<double, 3, CblasRowMajor> means_(method_to_test.size(),
+                                           block_size.size(), grid_size.size());
+  mdarray<double, 3, CblasRowMajor> std_dev_(
+      method_to_test.size(), block_size.size(), grid_size.size());
+
+  timings_.zero();
 
   timer__.start("calculate_reduction");
 
@@ -178,197 +202,110 @@ void performance_tests(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
   indicators::show_console_cursor(false);
 
   fmt::print("Collecting timing data. Be patient\n");
-  int bk = 0;
+  for (int mt = 0; mt < method_to_test.size(); mt++) {
+    std::string log_string = method_to_test[mt].first + " " +
+                             std::to_string(mt + 1) + "/" +
+                             std::to_string(method_to_test.size());
+    bar.set_option(indicators::option::PostfixText{log_string});
+    bar.set_progress(mt / method_to_test.size());
 
-  bar.set_progress(0);
-  bar.set_option(indicators::option::PostfixText{
-      "Two steps deterministic algorithm 1 / 6"});
-
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int st = 0; st < 10; st++) {
-        const auto start{std::chrono::steady_clock::now()};
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double res_ =
-              reduce_step_det(stream__, threadBlock, block, number_of_fp__,
-                              data__.at<device_t::GPU>(sample, 0),
-                              static_cast<double *>(scratch__));
-        }
-        const auto stop{std::chrono::steady_clock::now()};
-        const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(0, bk, bi, st) = elapsed_seconds.count();
+    switch (method_to_test[mt].second) {
+    case reduction_method::cub_reduce_method: {
+      const auto start{std::chrono::steady_clock::now()};
+      for (int sample = 0; sample < data__.size(0); sample++) {
+        double res_ =
+            cub_reduce(stream__, temp_storage_bytes, temp_storage,
+                       number_of_fp__, data__.at<device_t::GPU>(sample, 0),
+                       static_cast<double *>(scratch__));
       }
-    }
-  }
-
-  bar.set_progress(17);
-  bar.set_option(indicators::option::PostfixText{
-      "single step deterministic algorithm 2 / 6"});
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int st = 0; st < 10; st++) {
-        const auto start{std::chrono::steady_clock::now()};
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double res_ = reduce_step_det_single_round(
-              stream__, threadBlock, block, number_of_fp__,
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch__));
+      auto stop{std::chrono::steady_clock::now()};
+      const std::chrono::duration<double> elapsed_seconds{stop - start};
+      for (int bk = 0; bk < block_size.size(); bk++) {
+        for (int gs = 0; gs < grid_size.size(); gs++) {
+          for (int st = 0; st < 10; st++) {
+            timings_(mt, bk, gs, st) = elapsed_seconds.count();
+          }
         }
-        const auto stop{std::chrono::steady_clock::now()};
-        const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(1, bk, bi, st) = elapsed_seconds.count();
       }
-    }
-  }
-  bar.set_progress(33);
-  bar.set_option(indicators::option::PostfixText{
-      "two step deterministic algorithm with shuffle: 3 / 6"});
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
+    } break;
+    case reduction_method::single_pass_gpu_atomic_only: {
+      std::vector<double> tt(10, 0.0);
       for (int st = 0; st < 10; st++) {
-        const auto start{std::chrono::steady_clock::now()};
+        auto start{std::chrono::steady_clock::now()};
         for (int sample = 0; sample < data__.size(0); sample++) {
-          double res_ = reduce_step_det_shuffle(
-              stream__, threadBlock, block, number_of_fp__,
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch__));
+          double res_ = reduce(method_to_test[mt].second, stream__,
+                               block_size[0], grid_size[0], number_of_fp__,
+                               data__.at<device_t::GPU>(sample, 0),
+                               static_cast<double *>(scratch__));
         }
-        const auto stop{std::chrono::steady_clock::now()};
+        auto stop{std::chrono::steady_clock::now()};
         const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(2, bk, bi, st) = elapsed_seconds.count();
+        tt[st] = elapsed_seconds.count();
       }
-    }
-  }
-
-  bar.set_progress(50);
-  bar.set_option(indicators::option::PostfixText{
-      "single step deterministic algorithm with shuffle: 4 / 6"});
-
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int st = 0; st < 10; st++) {
-
-        const auto start{std::chrono::steady_clock::now()};
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double res_ = reduce_step_det_shuffle_single_round(
-              stream__, threadBlock, block, number_of_fp__,
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch__));
+      for (int bk = 0; bk < block_size.size(); bk++) {
+        for (int gs = 0; gs < grid_size.size(); gs++) {
+          for (int st = 0; st < 10; st++) {
+            timings_(mt, bk, gs, st) = tt[st];
+          }
         }
-        const auto stop{std::chrono::steady_clock::now()};
-        const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(3, bk, bi, st) = elapsed_seconds.count();
       }
-    }
-  }
-
-  bar.set_progress(67);
-  bar.set_option(indicators::option::PostfixText{
-      "two steps non deterministic algorithm with shuffle: 5 / 6"});
-
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int st = 0; st < 10; st++) {
-        const auto start{std::chrono::steady_clock::now()};
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double res_ =
-              reduce_step_non_det(stream__, threadBlock, block, number_of_fp__,
-                                  data__.at<device_t::GPU>(sample, 0),
-                                  static_cast<double *>(scratch__));
-        }
-        const auto stop{std::chrono::steady_clock::now()};
-        const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(4, bk, bi, st) = elapsed_seconds.count();
-      }
-    }
-  }
-
-  bar.set_progress(84);
-  bar.set_option(indicators::option::PostfixText{"CUB reduce: 6 / 6"});
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int st = 0; st < 10; st++) {
-        const auto start{std::chrono::steady_clock::now()};
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double res__ =
-              cub_reduce(stream__, temp_storage_bytes, temp_storage,
-                         number_of_fp__, data__.at<device_t::GPU>(sample, 0),
+    } break;
+    default: {
+      for (int bk = 0; bk < block_size.size(); bk++) {
+        for (int gs = 0; gs < grid_size.size(); gs++) {
+          for (int st = 0; st < 10; st++) {
+            const auto start{std::chrono::steady_clock::now()};
+            for (int sample = 0; sample < data__.size(0); sample++) {
+              double res_ =
+                  reduce(method_to_test[mt].second, stream__, block_size[bk],
+                         grid_size[gs], number_of_fp__,
+                         data__.at<device_t::GPU>(sample, 0),
                          static_cast<double *>(scratch__));
+            }
+            const auto stop{std::chrono::steady_clock::now()};
+            const std::chrono::duration<double> elapsed_seconds{stop - start};
+            timings_(mt, bk, gs, st) = elapsed_seconds.count();
+          }
         }
-        const auto stop{std::chrono::steady_clock::now()};
-        const std::chrono::duration<double> elapsed_seconds{stop - start};
-        timings_(5, bk, bi, st) = elapsed_seconds.count();
       }
+    } break;
     }
   }
   bar.set_progress(100);
   // Show cursor
   indicators::show_console_cursor(true);
 
-  // double res_kahan__ = KahanBabushkaNeumaierSum(data__.at<device_t::CPU>(0,
-  // 0), 1000000);
-
-  // double res_ = reduce_step_det_shuffle_single_round(stream__, 512, -1,
-  // 1000000,
-  //                                                   data__.at<device_t::GPU>(0,
-  //                                                   0), static_cast<double
-  //                                                   *>(scratch_));
-
-  // double res1__ = cub_reduce(stream__, temp_storage_bytes, temp_storage,
-  // 1000000, data__.at<device_t::GPU>(0, 0), static_cast<double *>(scratch_));
-
-  // uint64_t res11__, res12__, res13__;
-  // std::memcpy(&res11__, &res_, sizeof(double));
-  // std::memcpy(&res12__, &res_kahan__, sizeof(double));
-  // std::memcpy(&res13__, &res1__, sizeof(double));
-  // fmt::print("Sum reduce perso {0:#x}  {1:#x} cub {2:#x}\n", res11__,
-  // res12__, res13__);
-
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "timing results", 60);
+             "", "timing results", 70);
 
-  fmt::print("#thread #block    det    det_single_pass     det_shuffle     "
-             "det_shuffle_single_pass "
-             "    non-det      cub\n");
-
-  std::vector<double> mean_(6);
-  std::vector<double> std_dev_(6);
-
-  for (int threadBlock = 64, bk = 0; threadBlock < 1024;
-       threadBlock *= 2, bk++) {
-    int bi;
-    for (int block = 2, bi = 0; block < max_num_blocks__; block *= 2, bi++) {
-      for (int i = 0; i < 6; i++) {
-        mean_[i] = mean(timings_.at<device_t::CPU>(i, bk, bi, 0), 10);
-        std_dev_[i] = std_dev(timings_.at<device_t::CPU>(i, bk, bi, 0), 10);
+  for (int mt = 0; mt < method_to_test.size(); mt++) {
+    for (int bk = 0; bk < block_size.size(); bk++) {
+      for (int gs = 0; gs < grid_size.size(); gs++) {
+        means_(mt, bk, gs) =
+            mean(timings_.at<device_t::CPU>(mt, bk, gs, 0), 10);
+        std_dev_(mt, bk, gs) =
+            std_dev(timings_.at<device_t::CPU>(mt, bk, gs, 0), 10);
       }
-      fmt::print("{} {} {:9.9} {:9.9} {:9.9} {:9.9} {:9.9} {:9.9} {:9.9} "
-                 "{:9.9} {:9.9} {:9.9} {:9.9} {:9.9}\n",
-                 threadBlock, block, mean_[0], std_dev_[0], mean_[1],
-                 std_dev_[1], mean_[2], std_dev_[2], mean_[3], std_dev_[3],
-                 mean_[4], std_dev_[4], mean_[5], std_dev_[5]);
     }
   }
   timer__.stop("calculate_reduction");
   whip::free(temp_storage);
   whip::free(scratch__);
-  FILE *f = fopen("performance_results.dat", "w+");
-  fwrite(timings_.at<device_t::CPU>(), sizeof(double), timings_.size(), f);
+
+  std::string filename_ = "performance_results_" + GPU_TYPE + ".csv";
+  FILE *f = fopen(filename_.c_str(), "w+");
+  for (int mt = 0; mt < method_to_test.size(); mt++) {
+    for (int bk = 0; bk < block_size.size(); bk++) {
+      for (int gs = 0; gs < grid_size.size(); gs++) {
+        fprintf(f, "%s,%d,%d,%.15lf,%.15lf\n", method_to_test[mt].first.c_str(),
+                block_size[bk], grid_size[gs], means_(mt, bk, gs),
+                std_dev_(mt, bk, gs));
+      }
+    }
+  }
   fclose(f);
-  timings_.clear();
 }
 
 void cross_platform_reproducibility(cxxopts::ParseResult &result,
@@ -396,7 +333,7 @@ void cross_platform_reproducibility(cxxopts::ParseResult &result,
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "Test 1!", 60);
+             "", "Cross platform reproducibility", 70);
 
   fmt::print(
       "Check that the deterministic version of the reduce function gives the\n"
@@ -423,9 +360,10 @@ void cross_platform_reproducibility(cxxopts::ParseResult &result,
   std::vector<uint64_t> res(data__.size(0));
   //  std::cout << std::hex << "{" << std::endl;
   for (int sample = 0; sample < data__.size(0); sample++) {
-    double res_ = reduce_step_det(stream__, 64, -1, data__.size(1),
-                                  data__.at<device_t::GPU>(sample, 0),
-                                  static_cast<double *>(scratch__));
+    double res_ =
+        reduce(reduction_method::two_pass_gpu_det_kahan_cpu, stream__, 64, -1,
+               data__.size(1), data__.at<device_t::GPU>(sample, 0),
+               static_cast<double *>(scratch__));
     std::memcpy(&res[sample], &res_, sizeof(double));
     //    std::cout << "0x" << res[sample] <<"," << std::endl;
   }
@@ -451,9 +389,10 @@ void cross_platform_reproducibility(cxxopts::ParseResult &result,
   fmt::print("shared mem two steps: OK\n");
 
   for (int sample = 0; sample < data__.size(0); sample++) {
-    double res_ = reduce_step_det_shuffle(stream__, 64, -1, data__.size(1),
-                                          data__.at<device_t::GPU>(sample, 0),
-                                          static_cast<double *>(scratch__));
+    double res_ =
+        reduce(reduction_method::two_pass_gpu_det_shuffle_kahan_cpu, stream__,
+               64, -1, data__.size(1), data__.at<device_t::GPU>(sample, 0),
+               static_cast<double *>(scratch__));
     std::memcpy(&res[sample], &res_, sizeof(double));
   }
   check_ok = true;
@@ -479,9 +418,12 @@ void cross_platform_reproducibility(cxxopts::ParseResult &result,
   whip::free(scratch__);
 }
 
-void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
-           std::vector<whip::stream_t> &stream_vector_, generator_t gen,
-           void *scratch_, mdarray<double, 2, CblasRowMajor> &data__) {
+void generate_variability_distribution(
+    cxxopts::ParseResult &result, rt_graph::Timer &timer__,
+    std::vector<whip::stream_t> &stream_vector_) {
+  generator_t gen;
+  double *scratch_;
+  mdarray<double, 2, CblasRowMajor> data_;
   const bool variable_length_reduction_ = !result["atomic"].as<bool>();
   const int number_of_gpus = 1;
   const int average_length = 10;
@@ -502,21 +444,31 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
       mdarray<double, 2, CblasRowMajor>(
           number_of_samples, number_of_elements_per_reduction.size());
 
+  data_ = mdarray<double, 2, CblasRowMajor>(100, max_number_of_elements);
+  whip::malloc(&scratch_, sizeof(double) * 64 * max_blocks);
+  data_.allocate(memory_t::device);
+
+  CreateGenerator(&gen, result["seed"].as<unsigned int>());
+
   std::vector<double> min_(number_of_elements_per_reduction.size(), 0.0);
   std::vector<double> max_(number_of_elements_per_reduction.size(), 0.0);
   mdarray<double, 2, CblasRowMajor> det_sum_(
-      data__.size(0), number_of_elements_per_reduction.size());
+      data_.size(0), number_of_elements_per_reduction.size());
 
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "test2!", 60);
+             "", "test2!", 70);
 
-  fmt::print("This test generates samples lists of various length and sums up\n"
-             "the lists using two tree reduction algorithms, one using\n"
-             "deterministic implementation on CPU as a last stage, the other using\n"
-             "the atomicAdd instruction. The relative error between the two\n"
-             "algorithm is stored in a file for further analysis.\n\n");
+  fmt::print("This function computes the scalar variability from a\n"
+             "set of 100 lists of various lengths ranging from {0:d} to\n"
+             "{1:d}. We use the single pass with block reduction for the\n"
+             "deterministic method and the single pass with atomicAdd for\n"
+             "the non deterministic variant. The only difference between\n"
+             "the two methods is the last stage.\n",
+             result["min_reduction_size"].as<int>(),
+             result["max_reduction_size"].as<int>());
+
   timer__.start("sampling");
   for (int sp = 0; sp < number_of_iterations; sp++) {
     if (sp == 0) {
@@ -526,19 +478,20 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
                               result["distribution_amplitude"].as<double>(),
                               result["distribution_center"].as<double>(),
                               result["standard_deviation"].as<double>(),
-                              data__.at<device_t::GPU>(), data__.size());
+                              data_.at<device_t::GPU>(), data_.size());
       timer__.stop("generate_rng");
 
       timer__.start("reduction_compute_ref");
       for (int step = 0; step < number_of_elements_per_reduction.size();
            step++) {
-        for (int sample = 0; sample < data__.size(0); sample++) {
+        for (int sample = 0; sample < data_.size(0); sample++) {
           // compute the reference version using deterministic summation
-          double result_reference_ = reduce_step_det(
-              stream_vector_[step], 64, -1,
-              number_of_elements_per_reduction[step],
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch_) + step * max_blocks);
+          double result_reference_ =
+              reduce(reduction_method::single_pass_gpu_det_shared,
+                     stream_vector_[step], 64, -1,
+                     number_of_elements_per_reduction[step],
+                     data_.at<device_t::GPU>(sample, 0),
+                     static_cast<double *>(scratch_) + step * max_blocks);
           det_sum_(sample, step) = result_reference_;
         }
       }
@@ -554,7 +507,7 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
 
     // #pragma omp parallel for
     for (int step = 0; step < number_of_elements_per_reduction.size(); step++) {
-      for (int sample = 0; sample < data__.size(0); sample++) {
+      for (int sample = 0; sample < data_.size(0); sample++) {
         // the reference version is computed right after generating the random
         // sequences.
 
@@ -564,16 +517,17 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
         // atomic ops. We can use much less atomics here
 
         double result_non_det_ =
-            reduce_step_non_det(stream_vector_[step], 64, -1,
-                                number_of_elements_per_reduction[step],
-                                data__.at<device_t::GPU>(sample, 0),
-                                static_cast<double *>(scratch_));
-        result_stat_(sp * data__.size(0) + sample, step) =
+            reduce(reduction_method::single_pass_gpu_shared_atomic,
+                   stream_vector_[step], 64, -1,
+                   number_of_elements_per_reduction[step],
+                   data_.at<device_t::GPU>(sample, 0),
+                   static_cast<double *>(scratch_));
+        result_stat_(sp * data_.size(0) + sample, step) =
             (result_non_det_ - det_sum_(sample, step)) / det_sum_(sample, step);
         min_[step] = std::min(min_[step],
-                              result_stat_(sp * data__.size(0) + sample, step));
+                              result_stat_(sp * data_.size(0) + sample, step));
         max_[step] = std::max(max_[step],
-                              result_stat_(sp * data__.size(0) + sample, step));
+                              result_stat_(sp * data_.size(0) + sample, step));
       }
     }
     timer__.stop("block_reduction");
@@ -591,21 +545,25 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
   }
 
   timer__.stop("sampling");
-  if (!result["csv_file"].as<bool>()) {
-    FILE *f = fopen("relative_error_block_reduction.dat", "w+");
-    fwrite(result_stat_.at<device_t::CPU>(), sizeof(double),
-           result_stat_.size(), f);
-    fclose(f);
+  std::string filename_ = "relative_error_block_reduction_";
+
+  if (result["distribution_type"].as<std::string>() == "uniform") {
+    filename_ += "uniform_";
+    if (std::abs(result["distribution_center"].as<double>()) > 1e-8)
+      filename_ += "centered_";
   } else {
-    FILE *f = fopen("relative_error_block_reduction.csv", "w+");
-    for (int step = 0; step < number_of_elements_per_reduction.size(); step++) {
-      fprintf(f, "%d,", number_of_elements_per_reduction[step]);
-      for (int sample = 0; sample < number_of_samples - 1; sample++)
-        fprintf(f, "%.16e,", result_stat_(sample, step));
-      fprintf(f, "%.16e\n", result_stat_(number_of_samples - 1, step));
-    }
-    fclose(f);
+    filename_ += "normal_";
   }
+
+  filename_ += GPU_TYPE + ".csv";
+  FILE *f = fopen(filename_.c_str(), "w+");
+  for (int step = 0; step < number_of_elements_per_reduction.size(); step++) {
+    fprintf(f, "%d,", number_of_elements_per_reduction[step]);
+    for (int sample = 0; sample < number_of_samples - 1; sample++)
+      fprintf(f, "%.16e,", result_stat_(sample, step));
+    fprintf(f, "%.16e\n", result_stat_(number_of_samples - 1, step));
+  }
+  fclose(f);
 
   if (result["atomic_only"].as<bool>()) {
     std::fill(min_.begin(), min_.end(), 0);
@@ -615,18 +573,20 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
       timer__.start("Reduce_atomic_add_only");
       for (int step = 0; step < number_of_elements_per_reduction.size();
            step++) {
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          double result_non_det_ = reduce_atomic(
-              stream_vector_[step], number_of_elements_per_reduction[step],
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch_));
-          result_stat_(sp * data__.size(0) + sample, step) =
+        for (int sample = 0; sample < data_.size(0); sample++) {
+          double result_non_det_ =
+              reduce(reduction_method::single_pass_gpu_atomic_only,
+                     stream_vector_[step], 64, -1,
+                     number_of_elements_per_reduction[step],
+                     data_.at<device_t::GPU>(sample, 0),
+                     static_cast<double *>(scratch_));
+          result_stat_(sp * data_.size(0) + sample, step) =
               (result_non_det_ - det_sum_(sample, step)) /
               det_sum_(sample, step);
           min_[step] = std::min(
-              min_[step], result_stat_(sp * data__.size(0) + sample, step));
+              min_[step], result_stat_(sp * data_.size(0) + sample, step));
           max_[step] = std::max(
-              max_[step], result_stat_(sp * data__.size(0) + sample, step));
+              max_[step], result_stat_(sp * data_.size(0) + sample, step));
         }
       }
       timer__.stop("Reduce_atomic_add_only");
@@ -641,110 +601,35 @@ void test2(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
         }
       }
     }
-    if (!result["csv_file"].as<bool>()) {
-      FILE *f = fopen("relative_error_atomicAdd_only.dat", "w+");
-      fwrite(result_stat_.at<device_t::CPU>(), sizeof(double),
-             result_stat_.size(), f);
-      fclose(f);
+    std::string filename_ = "relative_error_atomicAdd_only_";
+    if (result["distribution_type"].as<std::string>() == "uniform") {
+      filename_ += "uniform_";
+      if (std::abs(result["distribution_center"].as<double>()) > 1e-8)
+        filename_ += "centered_";
     } else {
-      FILE *f = fopen("relative_error_atomicAdd_only.csv", "w+");
-      for (int step = 0; step < number_of_elements_per_reduction.size();
-           step++) {
-        fprintf(f, "%d,", number_of_elements_per_reduction[step]);
-        for (int sample = 0; sample < number_of_samples - 1; sample++)
-          fprintf(f, "%.16e,", result_stat_(sample, step));
-        fprintf(f, "%.16e\n", result_stat_(number_of_samples - 1, step));
-      }
-      fclose(f);
+      filename_ += "normal_";
     }
-  }
-}
 
-void test3(cxxopts::ParseResult &result, rt_graph::Timer &timer__,
-           std::vector<whip::stream_t> &stream_vector_, generator_t gen,
-           void *scratch_, mdarray<double, 2, CblasRowMajor> &data__) {
-  // time the operation
-  // rt_graph::Timer timer_;
-  const bool variable_length_reduction_ = !result["atomic"].as<bool>();
-  const int number_of_gpus = 1;
-  const int average_length = 10;
-  const int number_of_samples = result["number_of_samples"].as<int>();
-  const int max_number_of_elements = result["max_reduction_size"].as<int>();
-  const int min_number_of_elements = result["min_reduction_size"].as<int>();
-  const int number_of_iterations = number_of_samples / (number_of_gpus * 100);
-  const int max_blocks = 2 * (max_number_of_elements + 64 - 1) / 64;
-
-  std::vector<int> number_of_elements_per_reduction;
-
-  for (int j = min_number_of_elements; j <= max_number_of_elements; j *= 10) {
-    number_of_elements_per_reduction.push_back(j);
-  }
-
-  if (number_of_elements_per_reduction.back() < max_number_of_elements)
-    number_of_elements_per_reduction.push_back(max_number_of_elements);
-
-  mdarray<double, 2, CblasRowMajor> result_stat_ =
-      mdarray<double, 2, CblasRowMajor>(
-          number_of_samples, number_of_elements_per_reduction.size());
-
-  std::vector<double> det_sum__(data__.size(0), 0.0);
-  std::vector<double> results__(10000);
-
-  mdarray<double, 3, CblasRowMajor> stats_(11, 5, average_length);
-  for (int stat = 0; stat < average_length; stat++) {
-    int round = 0;
-    generate_random_numbers(result["distribution_type"].as<std::string>(), gen,
-                            result["distribution_amplitude"].as<double>(),
-                            result["distribution_center"].as<double>(),
-                            result["standard_deviation"].as<double>(),
-                            data__.at<device_t::GPU>(), data__.size());
-    for (int num_atomic_ops = 4;
-         num_atomic_ops < (max_number_of_elements + 128 - 1) / 128;
-         num_atomic_ops *= 2) {
-      for (int sample = 0; sample < data__.size(0); sample++) {
-        det_sum__[sample] =
-            reduce_step_det(stream_vector_[0], 64, num_atomic_ops,
-                            data__.size(1), data__.at<device_t::GPU>(sample, 0),
-                            static_cast<double *>(scratch_));
-      }
-      for (int it = 0; it < 10000; it += data__.size(0)) {
-        for (int sample = 0; sample < data__.size(0); sample++) {
-          const double result = reduce_step_non_det(
-              stream_vector_[0], 64, num_atomic_ops, data__.size(1),
-              data__.at<device_t::GPU>(sample, 0),
-              static_cast<double *>(scratch_));
-          results__[it + sample] =
-              (1.0e16) * (det_sum__[sample] - result) / det_sum__[sample];
-        }
-      }
-      stats_(round, 0, stat) = num_atomic_ops;
-      stats_(round, 1, stat) = mean<double>(results__);
-      stats_(round, 2, stat) = std_dev<double>(results__);
-      stats_(round, 3, stat) = min<double>(results__);
-      stats_(round, 4, stat) = max<double>(results__);
-
-      fmt::print("{} {} {} {} {}\n", num_atomic_ops, mean<double>(results__),
-                 std_dev<double>(results__), min<double>(results__),
-                 max<double>(results__));
-      round++;
+    filename_ += GPU_TYPE + ".csv";
+    FILE *f = fopen(filename_.c_str(), "w+");
+    for (int step = 0; step < number_of_elements_per_reduction.size(); step++) {
+      fprintf(f, "%d,", number_of_elements_per_reduction[step]);
+      for (int sample = 0; sample < number_of_samples - 1; sample++)
+        fprintf(f, "%.16e,", result_stat_(sample, step));
+      fprintf(f, "%.16e\n", result_stat_(number_of_samples - 1, step));
     }
+    fclose(f);
   }
 
-  fmt::print("Final answer\n\n");
-
-  for (int s = 0; s < stats_.size(0); s++) {
-    std::vector<double> ts_(stats_.at<device_t::CPU>(s, 3, 0),
-                            stats_.at<device_t::CPU>(s, 3, average_length - 1));
-    fmt::print("{} {} {} {} {}\n", stats_(s, 0, 0), mean<double>(ts_),
-               std_dev<double>(ts_), min(ts_), max(ts_));
-  }
+  DestroyGenerator(gen);
+  data_.clear();
+  result_stat_.clear();
+  min_.clear();
+  max_.clear();
+  whip::free(scratch_);
 }
 
 int main(int argc, char **argv) {
-  generator_t gen;
-
-  double *scratch_;
-  mdarray<double, 2, CblasRowMajor> data_;
   rt_graph::Timer timer_;
 
   cxxopts::Options options("reduce_test",
@@ -760,7 +645,8 @@ int main(int argc, char **argv) {
       "A,distribution_amplitude", "Amplitude of the distribution",
       cxxopts::value<double>()->default_value("10.0"))(
       "atomic_only",
-      "Compute the sum using only atomic operations. Only used to compute the "
+      "Compute the sum using only atomic operations. Only used to compute "
+      "the "
       "distribution. Very slow",
       cxxopts::value<bool>()->default_value("false"))(
       "c,distribution_center",
@@ -770,9 +656,7 @@ int main(int argc, char **argv) {
       "d,distribution_type", "type of distribution, normal, uniform",
       cxxopts::value<std::string>()->default_value("uniform"))(
       "s,number_of_streams", "number of streams to use for the computations",
-      cxxopts::value<int>()->default_value("4"))(
-      "C,csv_file", "output results in the csv format",
-      cxxopts::value<bool>()->default_value("true"))(
+      cxxopts::value<int>()->default_value("1"))(
       "r,seed", "seed for the random number generator",
       cxxopts::value<unsigned int>()->default_value("0xa238abdf"))(
       "a,atomic",
@@ -791,23 +675,99 @@ int main(int argc, char **argv) {
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "Information about the simulations", 60);
+             "", "Information about the simulations", 70);
 
-  fmt::print("- RNG: XORWOW\n");
-  fmt::print("- Distribution: {}\n",
-             result["distribution_type"].as<std::string>());
-  fmt::print("- Distribution amplitude: {}\n",
+  fmt::print("{0:<40} {1:>30}\n", "RNG:", "XORWOW");
+  fmt::print("{0:<40} {1:>30}\n",
+             "Distribution:", result["distribution_type"].as<std::string>());
+  fmt::print("{0:<40} {1:>30}\n", "Distribution amplitude:",
              result["distribution_amplitude"].as<double>());
   if (result["distribution_type"].as<std::string>() == "normal")
-    fmt::print("- Std dev.: {}\n", result["standard_deviation"].as<double>());
-  fmt::print("- Distribution center: {}\n",
+    fmt::print("{0:<40} {1:>30}\n",
+               "Std dev.:", result["standard_deviation"].as<double>());
+  fmt::print("{0:<40} {1:>30}\n", "Distribution center:",
              result["distribution_center"].as<double>());
-  fmt::print("- Max reduction size: {}\n",
-             result["max_reduction_size"].as<int>());
-  fmt::print("- Min reduction size: {}\n",
-             result["min_reduction_size"].as<int>());
-  fmt::print("- Number of samples: {}\n",
-             result["number_of_samples"].as<int>());
+  fmt::print("{0:<40} {1:>30}\n",
+             "Max reduction size:", result["max_reduction_size"].as<int>());
+  fmt::print("{0:<40} {1:>30}\n",
+             "Min reduction size:", result["min_reduction_size"].as<int>());
+  fmt::print("{0:<40} {1:>30}\n",
+             "Number of samples:", result["number_of_samples"].as<int>());
+  fmt::print("\n");
+#ifdef REDUCE_USE_CUDA
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  switch (prop.major) {
+  case 7:
+    GPU_TYPE = "V100";
+    break;
+  case 8:
+    GPU_TYPE = "A100";
+    break;
+  case 9:
+    GPU_TYPE = "GH200";
+    break;
+  default:
+    GPU_TYPE = "V100";
+    break;
+  }
+#else
+  hipDeviceProp_t prop;
+  hipGetDeviceProperties(&prop, 0);
+  GPU_TYPE = "Mi250X";
+#endif
+
+  fmt::print("┌{0:─^{2}}┐\n"
+             "│{1: ^{2}}│\n"
+             "└{0:─^{2}}┘\n\n",
+             "", "Device properties", 70);
+
+  fmt::print("{0:<40} {1:>30}\n", "Device name:", prop.name);
+  fmt::print("{0:<40} {1:>30}\n", "Architecture:", GPU_TYPE);
+  fmt::print("{0:<40} {1:>30}\n", "warp size:", prop.warpSize);
+  fmt::print("\n");
+
+#ifdef REDUCE_USE_CUDA
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shuffle",
+      reduction_method::single_pass_gpu_det_shuffle));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shuffle_recursive",
+      reduction_method::single_pass_gpu_det_shuffle_recursive_gpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shuffle_kahan",
+      reduction_method::single_pass_gpu_det_shuffle_kahan_gpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shuffle_atomic",
+      reduction_method::single_pass_gpu_shuffle_atomic));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "two_pass_gnu_det_shuffle_kahan_cpu",
+      reduction_method::two_pass_gpu_det_shuffle_kahan_cpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "two_pass_gnu_det_shuffle_recursive_cpu",
+      reduction_method::two_pass_gpu_det_shuffle_recursive_cpu));
+#endif
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shared", reduction_method::single_pass_gpu_det_shared));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_kahan",
+      reduction_method::single_pass_gpu_det_kahan_gpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_det_recursive",
+      reduction_method::single_pass_gpu_det_recursive_gpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "single_pass_gpu_shared_atomic",
+      reduction_method::single_pass_gpu_shared_atomic));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "two_pass_gnu_det_recursive_cpu",
+      reduction_method::two_pass_gpu_det_recursive_cpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "two_pass_gnu_det_kahan_cpu",
+      reduction_method::two_pass_gpu_det_kahan_cpu));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "cub_reduce", reduction_method::cub_reduce_method));
+  method_to_test.push_back(std::make_pair<std::string, reduction_method>(
+      "atomic_only", reduction_method::single_pass_gpu_atomic_only));
 
   const bool variable_length_reduction_ = !result["atomic"].as<bool>();
   const int number_of_gpus = 1;
@@ -831,12 +791,6 @@ int main(int argc, char **argv) {
   for (auto &stream_ : stream_vector_)
     whip::stream_create(&stream_);
 
-  data_ = mdarray<double, 2, CblasRowMajor>(100, max_number_of_elements);
-  whip::malloc(&scratch_, sizeof(double) * 64 * max_blocks);
-  data_.allocate(memory_t::device);
-
-  CreateGenerator(&gen, result["seed"].as<unsigned int>());
-
   sanity_check(stream_vector_[0]);
 
   /* Check determinism across potentially different GPU */
@@ -853,13 +807,9 @@ int main(int argc, char **argv) {
     size of 64, while the grid size is computed based on it.
   */
 
-  timer_.start("test_2");
-  test2(result, timer_, stream_vector_, gen, scratch_, data_);
-  timer_.stop("test_2");
-
-  timer_.start("test_3");
-  test3(result, timer_, stream_vector_, gen, scratch_, data_);
-  timer_.stop("test_3");
+  timer_.start("generate_variability_distribution");
+  generate_variability_distribution(result, timer_, stream_vector_);
+  timer_.stop("generate_variability_distribution");
 
   auto timing_result = timer_.process();
   std::cout << timing_result.print(
@@ -870,13 +820,5 @@ int main(int argc, char **argv) {
     whip::stream_destroy(stream_);
 
   stream_vector_.clear();
-  whip::free(scratch_);
-  data_.clear();
-#ifdef REDUCE_USE_CUDA
-  curandDestroyGenerator(gen);
-#else
-  hiprandDestroyGenerator(gen);
-#endif
-
   return 0;
 }

@@ -13,44 +13,84 @@ typedef hiprandGenerator_t generator_t;
 
 #include <whip.hpp>
 
+
+enum reduction_method {
+  single_pass_gpu_det_shuffle,
+  single_pass_gpu_det_shuffle_kahan_gpu,
+  single_pass_gpu_det_shuffle_recursive_gpu,
+  single_pass_gpu_shuffle_atomic,
+  single_pass_gpu_det_shared,
+  single_pass_gpu_det_kahan_gpu,
+  single_pass_gpu_det_recursive_gpu,
+  single_pass_gpu_shared_atomic,
+  two_pass_gpu_det_shuffle_kahan_cpu,
+  two_pass_gpu_det_shuffle_recursive_cpu,
+  two_pass_gpu_det_recursive_cpu,
+  two_pass_gpu_det_kahan_cpu,
+  cub_reduce_method,
+  single_pass_gpu_atomic_only
+};
+
+enum rounding_mode {
+  round_towards_nearest,
+  round_towards_zero,
+  round_towards_plus_inf,
+  round_towards_minus_inf
+};
+
+enum warp_reduction_method {
+  shuffle_down,
+  shared_memory,
+  sync_warp
+};
+
+enum algorithm_type {
+  deterministic,
+  full_atomic_add,
+  last_stage_atomic_add
+};
+
+enum last_stage_summation_algorithm {
+  kahan_method,
+  recursive_method,
+  pairwise_method,
+  last_stage_on_cpu_kahan,
+  last_stage_on_cpu_recursive,
+  none
+};
+
+template <class T> T __host__ cub_reduce(whip::stream_t stream__,
+                                         size_t &temp_storage_bytes,
+                                         T *temp_storage,
+                                         const size_t size__,
+                                         T *data__,
+                                         T *scratch__);
+
+template <class T> __host__ T reduce(reduction_method method_,
+                                     whip::stream_t stream__,
+                                     const  int fixed_block__,
+                                     const  int grid_size__,
+                                     const  int size__,
+                                     const T *data__,
+                                     T *scratch__);
+
+
 void scale_the_darn_thing(int *neighbor_list__, const int number_of_elements__,
                           const int number_of_atoms__);
 
 void uniform_double(const int number_of_elements__, const double xmin,
                     const double xmax__, double *rng);
 
-template <class T> T reduce_atomic(whip::stream_t stream__, const int size__, T*data__, T*scratch__);
-
-template <typename T>
-T reduce_step_non_det(whip::stream_t stream__, const int block_size__,
-                      const int grid_size__, const int size__, T *data__,
-                      T *scratch__);
-template <typename T>
-T reduce_step_det(whip::stream_t stream__, const int block_size__,
-                  const int grid_size__, const int size__, T *data__,
-                  T *scratch__);
-template <typename T>
-T reduce_step_det_single_round(whip::stream_t stream__, const int block_size__,
-                               const int grid_size__, const int size__,
-                               T *data__, T *scratch__);
-template <typename T>
-T reduce_step_det_shuffle_single_round(whip::stream_t stream__,
-                                       const int block_size__,
-                                       const int grid_size__, const int size__,
-                                       T *data__, T *scratch__);
-template <typename T>
-T reduce_step_det_shuffle(whip::stream_t stream__, const int block_size__,
-                          const int grid_size__, const int size__, T *data__,
-                          T *scratch__);
-template <typename T>
-T cub_reduce(whip::stream_t stream__, size_t &temp_storage_bytes,
-             T *temp_storage, const size_t size__, T *data__, T *scratch__);
-template <typename T>
-void center_and_scale_distribution(T *data__, const T scal__, const T center__,
-                                   const int size__);
+template <typename T> T __host__ __device__ recursive_sum(const T *const data__, const unsigned int size__) {
+  T sum = 0;
+  for (auto i = 0u; i < size__; i++) {
+    sum += data__[i];
+  }
+  return sum;
+}
 
 /* ref : https://en.wikipedia.org/wiki/Kahan_summation_algorithm */
-template <typename T>
+template <typename T> __host__ __device__
 T KahanBabushkaNeumaierSum(const T *data__, const int size__) {
   T sum = (T)0;
   T c = (T)0;

@@ -63,7 +63,7 @@ __global__ void center_and_scale_distribution_gpu(T *data__, const T scal__,
   const int id = threadIdx.x + blockDim.x * blockIdx.x;
   if (id >= size__)
     return;
-  data__[id] = scal__ * (data__[id] + center__);
+  data__[id] = scal__ * (data__[id] - center__);
 }
 
 template <typename T>
