@@ -390,12 +390,12 @@ deterministic and the non deterministic sum respecitively. The variability is
 then calculated 100000 times for each of these arrays generating a total sample
 size of 1 million values. We repeat the same protocol with the normal
 distribution of zero mean and standard deviation of 1. The array size follows a
-geometric progression from 10 to 10000000 FP64 numbers with a step size of 10.
+geometric progression from 10 to 1000000 FP64 numbers with a step size of 10.
 
 We choose the kernels parameters to maximize the number of atomic operations. We
 fixed the thread block size to 64 and computed the number of blocks using the
-formula $(N - 128 - 1) / 128$. With $N = 10000000$, we find that the number of atomic
-operations is equal to 78126 when rounded to the closest largest integer. 
+formula $(N - 128 - 1) / 128$. With $N = 1000000$, we find that the number of atomic
+operations is equal to $7813$ when rounded to the closest largest integer. 
 
 A mathematica file is included in the repository for calculating the histogram
 and PDF associated to the scalar variability. 
@@ -458,7 +458,7 @@ the initial data distribution. We find that max $|V_s|\propto \sqrt{N}$ for
 uniformly distributed data while the exponent is higher for normally distributed
 data. These coefficients depend on the details of the implementation as well.
 Surpringly even a small number of atomic operations can be enough to have an
-impact down afterwards. 
+impact afterwards.
 
 It is often assumed that the variability induced by atomic operations can be
 treated as an additional source of gaussian noise but we could find any evidence
@@ -492,10 +492,38 @@ limited to $(N + 2 N_t - 1) / 2 N_t$ when $N_b$ is above this value.
 
 The timings are averaged over 10 runs to gather statistics. 
 
-### results
+### Results
+
+The main results are summarized in the table below
+
+| GPU   | Algorithm | (block x grid) sizes | time (in $ms$) | Performance penalty (in %) |
+|-------|-----------|----------------------|----------------|----------------------------|
+| SPSA  |           | $(512\times 128)$    | $6.456(8)$     | $0.$                       |
+| SPS   |           | $(512\times 128)$    | $6.469(11)$    | $-0.198538$                |
+| SPSA  |           | $(256\times 256)$    | $6.484(11)$    | $-0.429441$                |
+| SPS   | V100      | $(256\times 256)$    | $6.486(6)$     | $-0.472273$                |
+| SPSRC |           | $(512\times 128)$    | $6.488(9)$     | $-0.493289$                |
+| SPSA  |           | $(256\times 256)$    | $6.489(11)$    | $-0.516709$                |
+| TPRC  |           | $(512\times 128)$    | $6.490(6)$     | $-0.528162$                |
+| SPS   |           | $(256\times 256)$    | $6.507(8)$     | $-0.796182$                |
+|       |           |                      |                |                            |
+| SPSA  |           | $(512\times 512)$    | $3.019(23)$    | $0.$                       |
+| SPSA  |           | $(512\times 512)$    | $3.022(28)$    | $-0.122728$                |
+| SPSA  | GH200     | $(256\times 1024)$   | $3.047(22)$    | $-0.943353$                |
+| SPSA  |           | $(256\times 1024)$   | $3.053(11)$    | $-1.148$                   |
+| CU    |           | unkown               | $3.155301$     | $-4.50533$                 |
+|       |           |                      |                |                            |
+| TPRC  |           | $(512\times 256)$    | $6.275(12)$    | $0.$                       |
+| SPSA  |           | $(128\times 1024)$   | $6.319(31)$    | $-0.699394$                |
+| SPSA  | MI250X    | $(256\times 512)$    | $6.352(25)$    | $-1.23479$                 |
+| CU    |           | unkonwn              | $6.37804$      | $-1.63577$                 |
+| SPS   |           | $(256\times 512)$    | $6.552(23)$    | $-4.4171$                  |
+
+Most implementations of the sum are within a few percent at most from each others on all GPU families. Considering the error on the timings we could conclude that using a deterministic implementation of the sum has no impact on performance for all GPU families. The block and grid sizes do not greatly inpact the results either. Fixing these parameters improves cross-platform reproducibility as the summation order of all determinisitic algorithms only depends on the thread blocks and grid sizes.
+
+Curiously the implementation of the sum (CU) provided by the CUB/HIPCUB libraries is not the fastest implementation. The performance penalty reaches almost 5% on GH200. They still offer more functionalities than a custom implementation of the reduction and are run-to-run deterministic.
 
 # PyTorch Tests
-
 This directory holds all the PyTorch operation benchmark sweeps and the training and inference non-determinism tests.
 
 ## Repo organization
