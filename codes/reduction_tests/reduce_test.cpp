@@ -458,7 +458,7 @@ void generate_variability_distribution(
   fmt::print("┌{0:─^{2}}┐\n"
              "│{1: ^{2}}│\n"
              "└{0:─^{2}}┘\n\n",
-             "", "test2!", 70);
+             "", "Variability distribution", 70);
 
   fmt::print("This function computes the scalar variability from a\n"
              "set of 100 lists of various lengths ranging from {0:d} to\n"
@@ -628,6 +628,61 @@ void generate_variability_distribution(
   max_.clear();
   whip::free(scratch_);
 }
+void measure_atomic_ops_order(cxxopts::ParseResult &result,
+                              rt_graph::Timer &timer__,
+                              std::vector<whip::stream_t> &stream_vector_) {
+
+  generator_t gen_;
+  double *scratch_;
+  mdarray<double, 2, CblasRowMajor> data_;
+  mdarray<int, 2, CblasRowMajor> block_index_;
+
+  const int number_of_elements_ = 1000000;
+  const int number_of_repetitions_ = 100;
+  const int max_num_blocks_ = (number_of_elements_ + 64 - 1) / 64;
+  CreateGenerator(&gen_, result["seed"].as<unsigned int>());
+  block_index_ =
+      mdarray<int, 2, CblasRowMajor>(number_of_repetitions_, max_num_blocks_);
+  data_ = mdarray<double, 2, CblasRowMajor>(number_of_repetitions_,
+                                            number_of_elements_);
+  block_index_.allocate(memory_t::device);
+  data_.allocate(memory_t::device);
+  whip::malloc(&scratch_, sizeof(double) * 64 * max_num_blocks_);
+  fmt::print("┌{0:─^{2}}┐\n"
+             "│{1: ^{2}}│\n"
+             "└{0:─^{2}}┘\n\n",
+             "", "atomic ops execution order", 70);
+
+  fmt::print("This function measures the mapping between the block index \n"
+             "and the order in which the atomicInc is executed during a \n"
+             "sum calculation. We calculate the mapping {} times\n",
+             number_of_repetitions_);
+
+  timer__.start("gen_rng_gpu");
+  GenerateUniformDouble(gen_, data_.at<device_t::GPU>(), data_.size());
+  timer__.stop("gen_rng_gpu");
+
+  for (int ms = 0; ms < number_of_repetitions_; ms++) {
+    reduce_register_atomic(stream_vector_[0], number_of_elements_,
+                           data_.at<device_t::GPU>(ms, 0),
+                           block_index_.at<device_t::GPU>(ms, 0), scratch_);
+  }
+  block_index_.copy<memory_t::device, memory_t::host>();
+  std::string filename_ = "mapping_atomicInc_block_index_" + GPU_TYPE + ".csv";
+  FILE *f = fopen(filename_.c_str(), "w+");
+  for (int ms = 0; ms < number_of_repetitions_; ms++) {
+    const int max_num_blocks1_ = (number_of_elements_ + 128 - 1) / 128;
+    for (int bk = 0; bk < max_num_blocks1_ - 1; bk++) {
+      fprintf(f, "%d,", block_index_(ms, bk));
+    }
+    fprintf(f, "%d\n", block_index_(ms, max_num_blocks1_ - 1));
+  }
+  fclose(f);
+  whip::free(scratch_);
+  DestroyGenerator(gen_);
+  data_.clear();
+  block_index_.clear();
+}
 
 int main(int argc, char **argv) {
   rt_graph::Timer timer_;
@@ -663,7 +718,11 @@ int main(int argc, char **argv) {
       "Keep the table length constant but change the number of atomic ops",
       cxxopts::value<bool>()->default_value("false"))(
       "standard_deviation", "Standard deviation for the normal distribution",
-      cxxopts::value<double>()->default_value("0.5"))("h,help", "Print usage");
+      cxxopts::value<double>()->default_value("0.5"))(
+      "mapping",
+      "measure the mapping between the atomicInc execution order and the block "
+      "index",
+      cxxopts::value<bool>()->default_value("false"))("h,help", "Print usage");
 
   auto result = options.parse(argc, argv);
 
@@ -811,6 +870,9 @@ int main(int argc, char **argv) {
   generate_variability_distribution(result, timer_, stream_vector_);
   timer_.stop("generate_variability_distribution");
 
+  timer_.start("calculate_mapping");
+  measure_atomic_ops_order(result, timer_, stream_vector_);
+  timer_.stop("calculate_mapping");
   auto timing_result = timer_.process();
   std::cout << timing_result.print(
       {rt_graph::Stat::Count, rt_graph::Stat::Total, rt_graph::Stat::Percentage,

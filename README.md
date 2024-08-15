@@ -4,6 +4,7 @@ This repository contains additional instructions to build and use the codes used
 for the section III and IV of the paper titled "Impacts of floating-point
 non-associativity on reproducibility for HPC and deep learning applications".
 
+All codes are under the BSD license. 
 # Parallel sum
 
 The following section expands the section III of the paper. It gives more
@@ -374,12 +375,10 @@ error) while the other is a dynamical quantity. They are both linked to rounding
 error and non associativity of the floating point arithmetic.
 
 The relative error is a static quantity because the order of the operations is
-usually fixed during the analysis and in some sense may describe the properties
-of deterministic implementations of the operator under study. The variability on
+usually fixed during the analysis. The variability on
 the other hand measures the impact of time dependent random permutations of the
 same arithmetic operations. A typical example of such operation would
-be the atomicAdd instruction on GPU. A series of atomicAdd instructions will run
-sequentially but the order of execution runtime dependent. 
+be the atomicAdd instruction on GPU. 
 
 ### Parameters to compute the scalar variability
 
@@ -420,16 +419,19 @@ PDF $P(x)$ and $S_P$ its Shannon entropy.
 We computed the probability density functions of the scalar variability on the
 V100, GH200, and Mi250X gpus. The figure below shows the PDF of the GH200 vs
 V100 and Mi250X vs V100 plotted on the same axis for a set of uniformly
-distributed floating point numbers. 
-<p align="center">
-<img src="figures/Difference_distribution_mi250x_v100_uniform_distribution.png" width="300"> <img src="figures/Difference_distribution_gh200_v100_uniform_distribution.png" width="300">
-</p>
-All PDF look similar to the PDF of the
-variability calculated on the V100 with the grey area showing the overlap
-between the different distributions. The PDF of the GH200 are particularly close
-to the V100's while the pdf of Mi250X seem to be mirrored compared to the V100. 
-The overall shape does not really depend on the GPU family at least for the
-algorithms we tested.
+distributed floating point numbers. <p align="center"> <img
+src="figures/Difference_distribution_mi250x_v100_uniform_distribution.png"
+width="300"> <img
+src="figures/Difference_distribution_gh200_v100_uniform_distribution.png"
+width="300"> </p> 
+
+All PDF look similar to the PDF of the variability calculated
+on the V100 with the grey area shows the overlap between the different
+distributions. The PDF of the GH200 are particularly close to the V100's while
+the pdf of Mi250X seem to be mirrored compared to the V100. Considering how much
+all distributions overlap, we can assume that the GPU family has a relativelly
+minor impact on the the statistical properties of the variability at least for
+the algorithms we tested.
 
 The figures below give the pdf of the variability of uniformly and normally
 disitrbuted FP64 numbers for the three families of GPU we tested. 
@@ -444,7 +446,7 @@ idea that the pdf strongly depends on the data distribution and that it is not
 possible to make any generic statement about the pdf of the variability itself.
 
 Since all three figures are similar, we only plot the dependence of max $|V_s|$
-as a function of the array size for the V100 GPU with a power law of the form
+as a function of the array size for the V100 GPU. max $|V_s|$ can be described by a power law of the form
 $\beta N^\alpha$. 
 
 <p align="center"> 
@@ -453,42 +455,77 @@ src="figures/scaling_relation_max_variability_v100.png" width="400"
 title="Scaling relation of max $V_s$ as a function of the array size N."> 
 </p>
 
-Fitting the data with the power law show that the fitting coefficients depend on
-the initial data distribution. We find that max $|V_s|\propto \sqrt{N}$ for
+After fitting the data, we find that the fitting coefficients depend on
+the initial data distribution. max $|V_s|\propto \sqrt{N}$ for
 uniformly distributed data while the exponent is higher for normally distributed
 data. These coefficients depend on the details of the implementation as well.
 Surpringly even a small number of atomic operations can be enough to have an
 impact afterwards.
 
-It is often assumed that the variability induced by atomic operations can be
-treated as an additional source of gaussian noise but we could find any evidence
-reporting this in the litterature. To test this, we used the KL divergence
-criterion and found that all PDFs are well described by a gaussian distribution
-supporting the idea of variability is gaussian. 
+It is often assumed that the impact of non associativity combined with atomic
+instructions can be treated as an additional source of gaussian noise but we
+could not find any evidence in the litterature. To test this assumption, we
+applied the KL divergence criterion to the PDF and found that all PDFs are well
+described by a gaussian distribution. This result supports the idea of the
+distribution of the variability is gaussian. However we also found that changing
+the SPA to the AO method gives a multinodal distribution not a gaussian
+distribution as previously found. The variability distribution can also be
+influenced by other workloads running in parallel of
+the sum operation.   
 
-However we also found that changing the SPA to the AO method gives a multinodal
-distribution not a gaussian distribution as previously found. 
+### Execution order of atomic operations
 
-The initial data used in this section are all well distrbuted data. Data
-generated from simulations will have different distributions or often will be ill
-conditioned making the scalar variability even higher. 
+The execution order of atomic operations is unspecified and as our results show can lead to very large numerical differences between two successive applications of the same operator with the same initial data. To measure the connection between the block index and the order of in which the atomic instruction is executed, we modified the (SPS) method to register the block index after calling the atomicInc instruction. Replacing
+
+```c++
+    __threadfences();
+
+    bool __shared__ amLast = false;
+    if (threadIdx.x == 0) {
+        int prev = atomicInc(&retirementCount, gridSize.x);
+        amLast = (prev == (gridDim.x - 1));
+    }
+    __syncthreads();
+
+```
+with
+```c++
+    __threadfences();
+
+    bool __shared__ amLast = false;
+    if (threadIdx.x == 0) {
+        int prev = atomicInc(&retirementCount, gridSize.x);
+        block_index__[blockIdx.x] = prev;
+        amLast = (prev == (gridDim.x - 1));
+    }
+    __syncthreads();
+
+```
+gives a mapping between the execution order given by the `prev` variable and the block index. Full details about the code can be found in the `codes/reduction_test` directory. Add `--mapping` to run this test.
+
+To measure this mapping, we calculate the sum of 1000000 of random FP64 numbers. We deduce the PDF of the distribution of the quantity $\Delta b =$`blockIdx.x - prev` which measures the difference between the time when the atomic operation is issued and executed. The next figure shows the PDF of $\Delta b$ after two successive calls of the sum operator on one million FP64 numbers and the result of the KL divergence criterion using the normal distribution.
+<p align="center"> <img
+src="figures/mapping_atomicInc_block_index_V100_g1.png"
+width="400"> <img
+src="figures/mapping_atomicInc_block_index_V100_g2.png"
+width="400"></p>
+The PDF is run-to-run dependent but the results suggest that the PDF is well described by a normal distribution reither than a Cauchy distribution. Although not shown here, the GPU activity will also modify the PDF. The figure on the left is obtained after the GPU been idle while the figure on the right is calculated after the first call to the sum.
 
 ## Performances comparison
 
-
 ### Parameters for the performance comparison
 
-To measure the timings of the different implementations of the parallel sum
-included in the `c++` code, we generate a set of 100 arrays of 4 M uniformly
-distributed floating point numbers and compute the time required to calculate
-the sum for all implementations for different values of the kernels parameters
-$N_t$ and $N_B$. $N_t$ can only take values up to `1024`. The hardware
-limitation for $N_b$ have no practical impact some these tests. We do not
-optimize the code for each specific GPU either.
+To measure the timings of the different implementations of the parallel sum, we
+generate a set of 100 arrays of 4 M uniformly distributed floating point numbers
+and compute the time required to calculate the sum for all implementations for
+different values of the kernels parameters $N_t$ and $N_B$. $N_t$ can only take
+values up to `1024`. The hardware limitation for $N_b$ have no practical impact
+for these tests. We do not optimize the code for each specific GPU either as
+most of the performance comes from generic optimizations.
 
 All implementations are tested for $N_t = 64, 128, 256, 512$. The number of
-block N_b follows a geometric progression with a step of 4. It is automatically
-limited to $(N + 2 N_t - 1) / 2 N_t$ when $N_b$ is above this value.
+block $N_b$ follows a geometric progression with a step of 4. It is automatically
+limited to $(N + 2 N_t - 1) / 2 N_t$ if $N_b$ is above this value.
 
 The timings are averaged over 10 runs to gather statistics. 
 
@@ -519,16 +556,49 @@ The main results are summarized in the table below
 | CU    |           | unkonwn              | $6.37804$      | $-1.63577$                 |
 | SPS   |           | $(256\times 512)$    | $6.552(23)$    | $-4.4171$                  |
 
-Most implementations of the sum are within a few percent at most from each others on all GPU families. Considering the error on the timings we could conclude that using a deterministic implementation of the sum has no impact on performance for all GPU families. The block and grid sizes do not greatly inpact the results either. Fixing these parameters improves cross-platform reproducibility as the summation order of all determinisitic algorithms only depends on the thread blocks and grid sizes.
+Most implementations of the sum are within a few percent at most from each
+others on all GPU families. We can not really make any conclusion about which
+implementation is the faster as these tests only consider one array size but
+considering the margin of error on the timings using a deterministic
+implementation of the sum does not cost any performance penalty. 
 
-Curiously the implementation of the sum (CU) provided by the CUB/HIPCUB libraries is not the fastest implementation. The performance penalty reaches almost 5% on GH200. They still offer more functionalities than a custom implementation of the reduction and are run-to-run deterministic.
+Curiously the implementation of the sum (CU) provided by the CUB/HIPCUB
+libraries is not the fastest implementation although the reader could think the
+sum is optimized to a specific GPU. The performance penalty reaches almost 5% on
+GH200. They still offer more functionalities than a custom implementation of the
+reduction and are run-to-run deterministic.
+
+Optimizing the block and grid size does not bring much performance improvement
+either. These parameters could be selected based on the array size only and kept
+constant accross the different platforms with minimal cost over the total
+runtime of a code.
+
+## cross-platform reproducibility
+
+The c++ code also contains a simple cross-platform reproducibility test. In this
+test, we generate 100 arrays of random FP64 numbers (the distribution is
+irrelevant) and then compute the sum of each of these arrays. We use the same
+implementation for generating the reference values on the V100 GPU.
+
+Details about the test can be found in the code itself. We ran this test on
+Summit, Frontier and ALPS supercomputers and found that it is possible to get
+cross-platform determinisim on various GPU and CPU architectures without any
+change to the implementation. 
+
+However, cross-platform reproducibility is limited in this code as the current
+implementation does not support multi-gpu and is not invariants against
+permutation of the same initial data. Changing the kernel parameters will also
+impact the final result. Achieving true cross-platform reproducibility is
+possible though but the algorithms are more complex and slower than the
+implementation provided in this repository.
 
 # PyTorch Tests
-This directory holds all the PyTorch operation benchmark sweeps and the training and inference non-determinism tests.
+This directory holds all the PyTorch operation benchmark sweeps and the training
+and inference non-determinism tests.
 
 ## Repo organization
 
-Please note the repository is organized as follows, with the operator benchmarks presented in the paper in `test-suite/paper-results` and the full sweep in the parent `test-suite`
+Please note the repository is organized as follows, with the operator benchmarks presented in the paper in `codes/test-suite/paper-results` and the full sweep in the parent `test-suite`
 ```
 test-suite/
 │ └── data/

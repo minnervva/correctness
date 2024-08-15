@@ -74,6 +74,11 @@ template <class T> __host__ T reduce(reduction_method method_,
                                      const T *data__,
                                      T *scratch__);
 
+template<class T> __host__ T reduce_register_atomic(whip::stream_t stream__,
+                                           const int size__,
+                                           T *data__,
+                                           int *block_index__,
+                                           T *scratch__);
 
 void scale_the_darn_thing(int *neighbor_list__, const int number_of_elements__,
                           const int number_of_atoms__);

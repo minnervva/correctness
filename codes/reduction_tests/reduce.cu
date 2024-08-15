@@ -151,11 +151,9 @@ __device__ __inline__ void blockReduce(T *sdata, T &mySum,
 /* ----------------------------------------------------------------------------------
  */
 
-template <typename T,
-          unsigned int blockSize,
+template <typename T, unsigned int blockSize,
           last_stage_summation_algorithm last_stage,
-          warp_reduction_method warp_method__,
-          algorithm_type algo__>
+          warp_reduction_method warp_method__, algorithm_type algo__>
 __global__ void reduce_gpu(const T *g_idata, T *g_odata, unsigned int n) {
   // Handle to thread block group
   T *sdata = SharedMemory<T>();
@@ -186,9 +184,10 @@ __global__ void reduce_gpu(const T *g_idata, T *g_odata, unsigned int n) {
     i += gridSize;
   }
 
-  const bool single_round_ = (last_stage == last_stage_summation_algorithm::pairwise_method) ||
-    (last_stage == last_stage_summation_algorithm::recursive_method) ||
-    (last_stage == last_stage_summation_algorithm::kahan_method);
+  const bool single_round_ =
+      (last_stage == last_stage_summation_algorithm::pairwise_method) ||
+      (last_stage == last_stage_summation_algorithm::recursive_method) ||
+      (last_stage == last_stage_summation_algorithm::kahan_method);
 
   blockReduce<T, blockSize, warp_method__>(sdata, mySum, tid);
   if (algo__ == algorithm_type::deterministic) {
@@ -262,11 +261,101 @@ __global__ void reduce_gpu(const T *g_idata, T *g_odata, unsigned int n) {
   }
 }
 
+/*
+ * this kernel calculates the sum of floating point numbers and register the
+ * block index associated to the atomic operation executed on the memory
+ * controller.
+ */
+
+template <class T, unsigned int blockSize>
+__global__ void
+reduce_register_atomic_gpu(const T *__restrict__ g_idata, T *g_odata,
+                           int *__restrict__ block_index__, unsigned int n) {
+  // Handle to thread block group
+  T *sdata = SharedMemory<T>();
+  // perform first level of reduction,
+  // reading from global memory, writing to shared memory
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockSize * 2 + threadIdx.x;
+  unsigned int gridSize = blockSize * 2 * gridDim.x;
+  // use the end of scratch memory to store how many block are already done.
+
+  unsigned int *retirementCount = (unsigned int *)(g_odata + gridDim.x + 1);
+  T mySum = 0;
+
+  // we reduce multiple elements per thread.  The number is determined by the
+  // number of active thread blocks (via gridDim).  More blocks will result
+  // in a larger gridSize and therefore fewer elements per thread
+  while (i < n) {
+    mySum += g_idata[i];
+
+    // ensure we don't read out of bounds -- this is optimized away for powerOf2
+    // sized arrays
+    if (i + blockSize < n)
+      mySum += g_idata[i + blockSize];
+
+    i += gridSize;
+  }
+
+  blockReduce<T, blockSize, warp_reduction_method::shared_memory>(sdata, mySum,
+                                                                  tid);
+  // write result for this block to global mem. We do not optimize away the
+  // global write when we use the single pass algorithm with determinism
+  // because it would otherwise make the code non deterministic which is
+  // something we want to avoid at all costs.
+  if (tid == 0)
+    g_odata[blockIdx.x] = mySum;
+  // We have the option to let the last block do the final reduction instead
+  // of either calling the function once more or copy the partial results to
+  // CPU and do the final reduction on CPU. Both ways are deterministic but
+  // will lead to slightly different answers because of the order of the
+  // operations.
+
+  // On CPU we use Kahan while on GPU we use the tree reduction again. Which
+  // one is faster is also interesting.
+
+  if (gridDim.x > 1) {
+    __shared__ bool amLast;
+
+    // wait until all outstanding memory instructions in this thread are
+    // Finished
+    __threadfence();
+
+    // Thread 0 takes a ticket
+    if (tid == 0) {
+      unsigned int ticket = atomicInc(retirementCount, gridDim.x);
+      block_index__[ticket] = blockIdx.x;
+      // If the ticket ID is equal to the number of blocks, we are the last
+      // block!
+      amLast = (ticket == gridDim.x - 1);
+    }
+
+    __syncthreads();
+
+    // The last block sums the results of all other blocks
+    if (amLast) {
+      int i = tid;
+      mySum = (T)0;
+
+      while (i < gridDim.x) {
+        mySum += g_odata[i];
+        i += blockSize;
+      }
+
+      blockReduce<T, blockSize, warp_reduction_method::shared_memory>(
+          sdata, mySum, tid);
+
+      if (tid == 0) {
+        g_odata[0] = mySum;
+      }
+    }
+  }
+}
+
 /* ----------------------------------------------------------------------------------
  */
 
-template <typename T,
-          last_stage_summation_algorithm last_stage,
+template <typename T, last_stage_summation_algorithm last_stage,
           warp_reduction_method warp_reduction__, algorithm_type algo__>
 void reduce_step(whip::stream_t stream, int size, int threads, int blocks,
                  const T *d_idata, T *d_odata) {
@@ -390,66 +479,56 @@ T reduce(reduction_method method__, whip::stream_t stream__,
   bool single_pass = false;
   switch (method__) {
   case reduction_method::single_pass_gpu_det_shuffle_kahan_gpu: {
-    reduce_step<T,
-                last_stage_summation_algorithm::kahan_method,
+    reduce_step<T, last_stage_summation_algorithm::kahan_method,
                 warp_reduction_method::shuffle_down,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     single_pass = true;
   } break;
   case reduction_method::single_pass_gpu_det_shuffle_recursive_gpu: {
-    reduce_step<T,
-                last_stage_summation_algorithm::recursive_method,
+    reduce_step<T, last_stage_summation_algorithm::recursive_method,
                 warp_reduction_method::shuffle_down,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     single_pass = true;
   } break;
   case reduction_method::single_pass_gpu_det_shuffle: {
-    reduce_step<T,
-                last_stage_summation_algorithm::pairwise_method,
+    reduce_step<T, last_stage_summation_algorithm::pairwise_method,
                 warp_reduction_method::shuffle_down,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     single_pass = true;
   } break;
   case reduction_method::single_pass_gpu_det_kahan_gpu: {
-    reduce_step<T,
-                last_stage_summation_algorithm::kahan_method,
+    reduce_step<T, last_stage_summation_algorithm::kahan_method,
                 warp_reduction_method::shared_memory,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     single_pass = true;
-  }
-    break;
-  case reduction_method::single_pass_gpu_det_recursive_gpu: { 
-    reduce_step<T,
-                last_stage_summation_algorithm::recursive_method,
+  } break;
+  case reduction_method::single_pass_gpu_det_recursive_gpu: {
+    reduce_step<T, last_stage_summation_algorithm::recursive_method,
                 warp_reduction_method::shared_memory,
                 algorithm_type::deterministic>(stream__, size__, block_size,
-                                                grid_size, in, out);
+                                               grid_size, in, out);
     single_pass = true;
-  }
-    break;
+  } break;
   case reduction_method::single_pass_gpu_det_shared: {
-    reduce_step<T,
-                last_stage_summation_algorithm::pairwise_method,
+    reduce_step<T, last_stage_summation_algorithm::pairwise_method,
                 warp_reduction_method::shared_memory,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     single_pass = true;
   } break;
   case reduction_method::single_pass_gpu_shuffle_atomic: {
-    reduce_step<T,
-                last_stage_summation_algorithm::none,
+    reduce_step<T, last_stage_summation_algorithm::none,
                 warp_reduction_method::shuffle_down,
                 algorithm_type::last_stage_atomic_add>(
         stream__, size__, block_size, grid_size, in, out);
     single_pass = true;
   } break;
   case reduction_method::single_pass_gpu_shared_atomic: {
-    reduce_step<T,
-                last_stage_summation_algorithm::none,
+    reduce_step<T, last_stage_summation_algorithm::none,
                 warp_reduction_method::shared_memory,
                 algorithm_type::last_stage_atomic_add>(
         stream__, size__, block_size, grid_size, in, out);
@@ -461,16 +540,14 @@ T reduce(reduction_method method__, whip::stream_t stream__,
   } break;
   case reduction_method::two_pass_gpu_det_shuffle_recursive_cpu:
   case reduction_method::two_pass_gpu_det_shuffle_kahan_cpu:
-    reduce_step<T,
-                last_stage_summation_algorithm::none,
+    reduce_step<T, last_stage_summation_algorithm::none,
                 warp_reduction_method::shuffle_down,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
     break;
   case reduction_method::two_pass_gpu_det_recursive_cpu:
   case reduction_method::two_pass_gpu_det_kahan_cpu:
-    reduce_step<T,
-                last_stage_summation_algorithm::none,
+    reduce_step<T, last_stage_summation_algorithm::none,
                 warp_reduction_method::shared_memory,
                 algorithm_type::deterministic>(stream__, size__, block_size,
                                                grid_size, in, out);
@@ -531,6 +608,36 @@ template double reduce(reduction_method method__, whip::stream_t stream__,
                        const int fixed_block__, const int grid_size__,
                        const int size__, const double *data__,
                        double *scratch__);
+
+template <class T>
+T reduce_register_atomic(whip::stream_t stream__, const int size__, T *data__,
+                         int *block_index__, T *scratch__) {
+  T *in, *out;
+  int block_size = 64;
+  int grid_size = (size__ + 2 * block_size - 1) / (2 * block_size);
+  in = data__;
+  out = scratch__;
+  double result = 0.0;
+  int smemSize = 64 * sizeof(T);
+  // number of threads per block
+  // size of the block grid. The reduce algorithm add at least two elements
+  // per thread. so the block grid should NOT be size__/block_size but
+  // size__/ 2 * block_size__).
+  std::vector<T> tmp(grid_size, 0.0);
+  whip::memset_async(out + grid_size + 1, 0, sizeof(T), stream__);
+  reduce_register_atomic_gpu<T, 64>
+      <<<grid_size, block_size, smemSize, stream__>>>(in, out, block_index__,
+                                                      size__);
+  whip::memcpy_async(&result, out, sizeof(T), whip::memcpy_device_to_host,
+                     stream__);
+  whip::stream_synchronize(stream__);
+
+  return result;
+}
+
+template double reduce_register_atomic(whip::stream_t stream__,
+                                       const int size__, double *data__,
+                                       int *block_index__, double *scratch__);
 
 template double cub_reduce(whip::stream_t stream__, size_t &temp_storage_bytes,
                            double *temp_storage, const size_t size__,
