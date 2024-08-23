@@ -294,7 +294,7 @@ __global__ void pairwise_reduce(const double *data, const int size, double *part
         partial_results[blockIdx.x] = partial_sum;
 }
 ```
-The function `pairwise_reduce` only returns the partial sums and requires a global synchronization barrier to ensure that all partial sums are available before calculating the final sum. We describe three different methods to implement the second stage and the synchronization barrier. The first method uses the `atomicAdd` instruction to update the accumulator instead of copying the partial results back to memory after replacing these lines of code
+The function `pairwise_reduce` only returns the partial sums and requires a global synchronization barrier to ensure that all partial sums are available before calculating the final sum. We describe three different methods to implement the second stage and the synchronization barrier. The first method uses the `atomicAdd` instruction to update the accumulator instead of copying the partial results back to memory. Replacing these lines of code
 ```
     if (threadIdx.x == 0)
         partial_results[blockIdx.x] = partial_sum;
@@ -304,7 +304,7 @@ with
     if (threadIdx.x == 0)
         atomicAdd(partial_results, partial_sum);
 ```
-in the `pairwise` function. This is The (AO) method described in the main text. It is again very simple replacement as the full sum is given by the first element of the `partial_results` array but the function is not deterministic for floating point numbers. 
+in the `pairwise` function is enough to get the expected behavior. This is The (AO) method described in the main text. It is again very simple replacement as the full sum is given by the first element of the `partial_results` array but the function is not deterministic for floating point numbers.
 
 Two kernels K<sub>1</sub> and K<sub>2</sub> launched on the same stream will run sequentially following the submission order. This property can be used at our advantage to simulate a global synchronization barrier between different parts of the code but it requires two kernels launches to be effective. The second kernel can be anything from an other pairwise reduction to a memory transfer between GPU and CPU. We choose the second method and copy all partial results back to CPU before calculating the final sum on CPU. It is the TPRC method described in  the main text. The TPRC method is deterministic by construction.
 
@@ -472,44 +472,6 @@ the SPA to the AO method gives a multinodal distribution not a gaussian
 distribution as previously found. The variability distribution can also be
 influenced by other workloads running in parallel of
 the sum operation.   
-
-### Execution order of atomic operations
-
-The execution order of atomic operations is unspecified and as our results show can lead to very large numerical differences between two successive applications of the same operator with the same initial data. To measure the connection between the block index and the order of in which the atomic instruction is executed, we modified the (SPS) method to register the block index after calling the atomicInc instruction. Replacing
-
-```c++
-    __threadfences();
-
-    bool __shared__ amLast = false;
-    if (threadIdx.x == 0) {
-        int prev = atomicInc(&retirementCount, gridSize.x);
-        amLast = (prev == (gridDim.x - 1));
-    }
-    __syncthreads();
-
-```
-with
-```c++
-    __threadfences();
-
-    bool __shared__ amLast = false;
-    if (threadIdx.x == 0) {
-        int prev = atomicInc(&retirementCount, gridSize.x);
-        block_index__[blockIdx.x] = prev;
-        amLast = (prev == (gridDim.x - 1));
-    }
-    __syncthreads();
-
-```
-gives a mapping between the execution order given by the `prev` variable and the block index. Full details about the code can be found in the `codes/reduction_test` directory. Add `--mapping` to run this test.
-
-To measure this mapping, we calculate the sum of 1000000 of random FP64 numbers. We deduce the PDF of the distribution of the quantity $\Delta b =$`blockIdx.x - prev` which measures the difference between the time when the atomic operation is issued and executed. The next figure shows the PDF of $\Delta b$ after two successive calls of the sum operator on one million FP64 numbers and the result of the KL divergence criterion using the normal distribution.
-<p align="center"> <img
-src="figures/mapping_atomicInc_block_index_V100_g1.png"
-width="400"> <img
-src="figures/mapping_atomicInc_block_index_V100_g2.png"
-width="400"></p>
-The PDF is run-to-run dependent but the results suggest that the PDF is well described by a normal distribution reither than a Cauchy distribution. Although not shown here, the GPU activity will also modify the PDF. The figure on the left is obtained after the GPU been idle while the figure on the right is calculated after the first call to the sum.
 
 ## Performances comparison
 
