@@ -312,7 +312,7 @@ The last method is a bit more advanced and prone to error if implemented incorre
 ```c++
 __device__ int retirementCount = 0;
 
-__global__ void reduce_gpu_full(double *sdata, int size, double *res) {
+__global__ void reduce_gpu_sptr(double *sdata, int size, double *res) {
     int tid = threadIdx.x + blockIdx.x * blodkDim.x;
     
     extern __shared__ double smem[];
@@ -356,8 +356,10 @@ The last block incrementing the `retirementCount` counter is responsible for
 calculating the final sum. Which block does computation is runtime dependent but
 this kernel always returns a deterministic result undependently of the 
 execution order of the `atomicInc` instruction. This technique is used in the
-SPS method described in the main text. The CUB and hipcub libraries also use
+SPTR method described in the main text. The CUB and hipcub libraries also use
 similar techniques in their sum function.
+
+The last summation uses the recursive method (the SPTR method in the paper) but it is also possible to implement it with the `block_reduce` function. The second method is named SPRG in the main text.
 
 ### Code optimization
 
@@ -384,7 +386,7 @@ be the atomicAdd instruction on GPU.
 
 To compute the probability density functions of the scalar variability, we
 generate a set of 100 arrays of 1 million 64 bits floating point numbers taken
-from the uniform distribution. We use the SPS and SPA methods to compute the
+from the uniform distribution. We use the SPTR and SPA methods to compute the
 deterministic and the non deterministic sum respecitively. The variability is
 then calculated 100000 times for each of these arrays generating a total sample
 size of 1 million values. We repeat the same protocol with the normal
@@ -497,26 +499,26 @@ The main results are summarized in the table below
 
 | GPU   | Algorithm | (block x grid) sizes | time (in $ms$) | Performance penalty (in %) |
 |-------|-----------|----------------------|----------------|----------------------------|
-| SPSA  |           | $(512\times 128)$    | $6.456(8)$     | $0.$                       |
-| SPS   |           | $(512\times 128)$    | $6.469(11)$    | $-0.198538$                |
-| SPSA  |           | $(256\times 256)$    | $6.484(11)$    | $-0.429441$                |
-| SPS   | V100      | $(256\times 256)$    | $6.486(6)$     | $-0.472273$                |
-| SPSRC |           | $(512\times 128)$    | $6.488(9)$     | $-0.493289$                |
-| SPSA  |           | $(256\times 256)$    | $6.489(11)$    | $-0.516709$                |
+| SPA  |           | $(512\times 128)$    | $6.456(8)$     | $0.$                       |
+| SPTR   |           | $(512\times 128)$    | $6.469(11)$    | $-0.198538$                |
+| SPA  |           | $(256\times 256)$    | $6.484(11)$    | $-0.429441$                |
+| SPTR   | V100      | $(256\times 256)$    | $6.486(6)$     | $-0.472273$                |
+| SPRC |           | $(512\times 128)$    | $6.488(9)$     | $-0.493289$                |
+| SPA  |           | $(256\times 256)$    | $6.489(11)$    | $-0.516709$                |
 | TPRC  |           | $(512\times 128)$    | $6.490(6)$     | $-0.528162$                |
-| SPS   |           | $(256\times 256)$    | $6.507(8)$     | $-0.796182$                |
+| SPTR   |           | $(256\times 256)$    | $6.507(8)$     | $-0.796182$                |
 |       |           |                      |                |                            |
-| SPSA  |           | $(512\times 512)$    | $3.019(23)$    | $0.$                       |
-| SPSA  |           | $(512\times 512)$    | $3.022(28)$    | $-0.122728$                |
-| SPSA  | GH200     | $(256\times 1024)$   | $3.047(22)$    | $-0.943353$                |
-| SPSA  |           | $(256\times 1024)$   | $3.053(11)$    | $-1.148$                   |
-| CU    |           | unkown               | $3.155301$     | $-4.50533$                 |
+| SPA  |           | $(512\times 512)$    | $3.019(23)$    | $0.$                       |
+| SPA  |           | $(512\times 512)$    | $3.022(28)$    | $-0.122728$                |
+| SPA  | GH200     | $(256\times 1024)$   | $3.047(22)$    | $-0.943353$                |
+| SPA  |           | $(256\times 1024)$   | $3.053(11)$    | $-1.148$                   |
+| CU    |           | unknown               | $3.155301$     | $-4.50533$                 |
 |       |           |                      |                |                            |
 | TPRC  |           | $(512\times 256)$    | $6.275(12)$    | $0.$                       |
-| SPSA  |           | $(128\times 1024)$   | $6.319(31)$    | $-0.699394$                |
-| SPSA  | MI250X    | $(256\times 512)$    | $6.352(25)$    | $-1.23479$                 |
-| CU    |           | unkonwn              | $6.37804$      | $-1.63577$                 |
-| SPS   |           | $(256\times 512)$    | $6.552(23)$    | $-4.4171$                  |
+| SPA  |           | $(128\times 1024)$   | $6.319(31)$    | $-0.699394$                |
+| SPA  | MI250X    | $(256\times 512)$    | $6.352(25)$    | $-1.23479$                 |
+| CU    |           | unknown              | $6.37804$      | $-1.63577$                 |
+| SPTR   |           | $(256\times 512)$    | $6.552(23)$    | $-4.4171$                  |
 
 Most implementations of the sum are within a few percent at most from each
 others on all GPU families. We can not really make any conclusion about which
@@ -640,5 +642,10 @@ to discuss what you would like to change.
 
 Please make sure to update tests as appropriate.
 
-# Hardware 
+# Hardware description
 
+Tests on GH200 are run on the Alps supercomputing system located at CSCS running SLE 15 (enterprise). Each node has 4 GH200 with 72 ARM cores, 128 GB LPDDR5, and one H100 GPU with 96 GB HBM3 memory each.
+
+Tests for the V100 are run on the Summit supercomputer at the Oak Ridge Leadership Computing Facility (OLCF), running Redhat OS 8. Summit is an IBM system; each IBM Power System AC922 node has two Power9 CPUs with 512 GB of memory and 6 V100 NVidia GPU with 16GB of HBM2 memory. Tests on Mi250X AMD GPU are obtained on the Frontier supercomputer at OLCF, running SLE 15 (enterprise). Frontier is an HPE Cray EX supercomputer; each Frontier compute node has a 64-core AMD``Optimized 3rd Gen EPYC” CPU with 512 GB of DDR4 memory and 4 AMD MI250X GPUs, each with 2 Graphics Compute Dies (GCDs) for a total of 8 GCDs per node.
+
+Tests on the NVidia H100 are performed on a Groq host node3 in Groq ZankerLab running Ubuntu LTS 22.04.06. This machine has 2 H100's with 40GB HBM3 memory each and has an AMD EPYC 7302 16-Core Processor host CPU with 2 sockets, 16 cores per socket and 2 threads per core. Tests on the LPU accelerator are run on the $\text{GroqNode}^{\text{TM}}$ server `r01-gn-01` in Groq ZankerLab with $\text{GroqWare}^{\text{TM}}$ SDK 0.11 and Ubuntu LTS 22.04. A GroqNode has 8 Groq LPUs connected with a fully connected 88 RealScale™ chip-to-chip connectors and 2 AMD EPYC 7313 processors (3GHz, 16C/32T, 155W TDP each).
