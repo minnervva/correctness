@@ -1,3 +1,12 @@
+/* This file is part of correctness tests suite.
+ *
+ * Copyright (c), ORNL, ETH Zurich, Grog Inc.  All rights reserved.
+ *
+ * Please, refer to the LICENSE file in the root directory.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+
 #ifdef REDUCE_USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
